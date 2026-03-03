@@ -64,13 +64,13 @@ int main() {
     char *uri;
     char *protocol;
     char *response;
-    char html_header[] = "HTTP/1.1 200 OK\n"
+    const char html_header[] = "HTTP/1.1 200 OK\n"
                          "Content-Type: text/html; charset=UFT-8\n"
                          "Date: Fri, 21 Jun 2024 14:18:33 GMT\n"
                          "Last-Modified: Thu, 17 Oct 2019 07:18:26 GMT\n"
                          "Content-Length: %d\n"
                          "\n%s\n";
-    char html[] = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Hello World</title></head><body><h1>Hello World</h1></body></html>";
+    const char html[] = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Hello World</title></head><body><h1>Hello World</h1></body></html>";
     
     int rv, numbytes, response_length;
     
