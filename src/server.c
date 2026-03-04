@@ -21,7 +21,7 @@ int send_all(int s, char *buf, int *len) {
 
     while(total < *len) {
         n = send(s, buf+total, bytes_left, 0);
-        if (n == 1) { break; }
+        if (n == -1) { break; }
         total += n;
         bytes_left -= n;
     }
