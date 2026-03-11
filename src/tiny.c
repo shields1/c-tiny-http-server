@@ -1,15 +1,17 @@
-#include "src/include/tiny.h"
+#include "../src/include/tiny.h"
 
-int route_to_int(const char *route) {
-    //printf("Route is %s\n", route);
-    if (strcmp(route, "/") == 0) return 1;
-    if (strcmp(route, "/rocket.png") == 0) return 2;
-    if (strcmp(route, "/fonts/iosevka-regular.woff") == 0) return 3;
-    if (strcmp(route, "/fonts/iosevka-regular.woff2") == 0) return 4;
+int path_to_int(const char *path) {
+    //printf("path is %s\n", path);
+    if (strcmp(path, "/") == 0) return 1;
+    if (strcmp(path, "/rocket.png") == 0) return 2;
+    if (strcmp(path, "/fonts/iosevka-regular.woff") == 0) return 3;
+    if (strcmp(path, "/fonts/iosevka-regular.woff2") == 0) return 4;
     return 0; // default case
 }
-char *parse_route(const char *route) {
-    int val = route_to_int(route);
+
+
+char *parse_path(const char *path) {
+    int val = path_to_int(path);
 
     switch (val) {
         case 1: return "./static/index.html";
@@ -106,7 +108,7 @@ int main() {
     char buf[BUFFER_SIZE + 1];
     char *token;
     char *method;
-    char *route;
+    char *path;
     char *protocol;
     int rv, numbytes;
     
@@ -187,12 +189,12 @@ int main() {
             method = token; 
             // fetch uri 
             token = strtok(NULL, " ");
-            route = token;
+            path = token;
             // fetch protocol
             token = strtok(NULL, "\n");
             protocol = token;
 
-            printf("method: %s\nroute: %s\nprotocol: %s\n", method, route, protocol);
+            printf("method: %s\npath: %s\nprotocol: %s\n", method, path, protocol);
             //while(token != NULL) {
             //    printf(" %s\n", token);
             //    token = strtok(NULL, " ");
@@ -203,7 +205,7 @@ int main() {
             }
             printf("protocol is: %s\n", protocol);
 
-            const char *file = parse_route(route);
+            const char *file = parse_path(path);
             send_file(new_fd, file);
             // child closes his copy of new_fd
             close(new_fd);

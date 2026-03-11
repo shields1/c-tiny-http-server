@@ -16,8 +16,8 @@
 #define BACKLOG 10
 #define BUFFER_SIZE 1024
 
-int route_to_int(const char *route);
-char *parse_route(const char *route);
+int path_to_int(const char *path);
+char *parse_path(const char *path);
 int send_all(int s, char *buf, int *len);
 void send_file(int sock_fd, const char *path);
 void sigchld_handler(int s);
