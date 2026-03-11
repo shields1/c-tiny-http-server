@@ -11,7 +11,7 @@ SRC = $(wildcard $(SRC_DIR)/*.c)
 OBJ = $(SRC:$(SRC_DIR)/%.c=$(OBJ_DIR)/%.o)
 
 # Executable name and target directory
-TARGET = server
+TARGET = tiny
 
 # Default target: compile and link the program
 all: $(BIN_DIR)/$(TARGET)

@@ -1,20 +1,4 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <errno.h>
-
-#define PORT "3490"
-#define BACKLOG 10
-#define MAXLEN 1024
-#define BUFFER_SIZE 1024
-#define HEADER_OK "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+#include "src/include/tiny.h"
 
 int route_to_int(const char *route) {
     //printf("Route is %s\n", route);
@@ -33,11 +17,11 @@ char *parse_route(const char *route) {
         case 3: return "./static/fonts/iosevka-regular.woff";
         case 4: return "./static/fonts/iosevka-regular.woff2";
     }
-    return "./static/notfound.html";
+    return NULL;
 }
 
 int send_all(int s, char *buf, int *len) {
-    int total = 0; // how many bytes have we sent
+    int total = 0;         // how many bytes have we sent
     int bytes_left = *len; // how many we have left to send
     int n;
 
@@ -47,39 +31,58 @@ int send_all(int s, char *buf, int *len) {
         total += n;
         bytes_left -= n;
     }
-    *len = total; //return number actually sent header_len
+    *len = total;          //return number actually sent header_len
 
-    return n == -1 ? -1:0;// return -1 on failure, 0 on success
+    return n == -1 ? -1:0; // return -1 on failure, 0 on success
 }
 
-void send_html(int sock_fd, const char *route) {
-    FILE *html = fopen(route, "r");
-    if (!html) {
-        perror("Error opening html file");
+void send_file(int sock_fd, const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        const char *err = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n";
+        send_all(sock_fd, (char*)err, &(int){strlen(err)});
+        close(sock_fd);
         return;
     }
+    // find file size
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
 
-    char buf[BUFFER_SIZE] = {0};
-    int n_read = 0;
+    char header[256];
+    snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: %s\r\n"
+            "Content-Length: %ld\r\n"
+            "\r\n",
+            strstr(path, ".png") ? "image/png" :
+            strstr(path, ".woff") ? "font/woff" :
+            "text/html",
+            size);
+    int hlen = (int)strlen(header); 
+    if (send_all(sock_fd, header, &hlen) == -1) {
+        fclose(f);
+        close(sock_fd);
+        return;
+    }
     
-    // send header
-    send(sock_fd, HEADER_OK, strlen(HEADER_OK), 0);
-    // send payload
-    while ((n_read = fread(buf, sizeof(buf[0]), BUFFER_SIZE, html)) > 0) {
+    char buf[BUFFER_SIZE] = {0};
+    int n_read = 0; 
+    while ((n_read = fread(buf, sizeof(buf[0]), BUFFER_SIZE, f)) > 0) {
         if (send_all(sock_fd, buf, &n_read) == -1) {
             perror("send");
+            break;
         }
-   }
+    }
+    fclose(f);
+    close(sock_fd);
 }
 
 void sigchld_handler(int s) {
     (void)s; // quite unused variable warning
-
     // waitpid() might overwrite errno, so we save and restore it:
     int saved_errno = errno;
-
     while(waitpid(-1, NULL, WNOHANG) > 0);
-
     errno = saved_errno;
 }
 
@@ -100,7 +103,7 @@ int main() {
     struct sigaction sa;
     int yes = 1;
     char s[INET6_ADDRSTRLEN];
-    char buf[1025];
+    char buf[BUFFER_SIZE + 1];
     char *token;
     char *method;
     char *route;
@@ -168,37 +171,45 @@ int main() {
 
         inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof(s));
         printf("server: got connection from %s\n", s);
+        if (!fork()) {
+        //    close(sock_fd); // child does not need the listner
 
-        if ((numbytes = recv(new_fd, buf, sizeof(buf) - 1, 0)) == -1) {
-            perror("recv");
-            exit(EXIT_FAILURE);
-        }
-        buf[numbytes] = '\0';
-        printf("server: received %d bytes\n'%s'\n",numbytes, buf); 
         
-        // fetch HTTP method
-        token = strtok(buf, " ");
-        method = token; 
-        // fetch uri 
-        token = strtok(NULL, " ");
-        route = token;
-        // fetch protocol
-        token = strtok(NULL, "\n");
-        protocol = token;
+            if ((numbytes = recv(new_fd, buf, sizeof(buf) - 1, 0)) == -1) {
+                perror("recv");
+                exit(EXIT_FAILURE);
+            }
+            buf[numbytes] = '\0';
+            printf("server: received %d bytes\n'%s'\n",numbytes, buf); 
         
-        printf("method: %s\nroute: %s\nprotocol: %s\n", method, route, protocol);
-        while(token != NULL) {
-            printf(" %s\n", token);
+            // fetch HTTP method
+            token = strtok(buf, " ");
+            method = token; 
+            // fetch uri 
             token = strtok(NULL, " ");
-        }
-        if (strcmp(method, "GET") != 0) {
-            printf("method not GET");
-        }
-        printf("protocol is: %s\n", protocol);
+            route = token;
+            // fetch protocol
+            token = strtok(NULL, "\n");
+            protocol = token;
 
-        const char *file = parse_route(route);
-        send_html(new_fd, file);
+            printf("method: %s\nroute: %s\nprotocol: %s\n", method, route, protocol);
+            //while(token != NULL) {
+            //    printf(" %s\n", token);
+            //    token = strtok(NULL, " ");
+            //}
+            if (strcmp(method, "GET") != 0) {
+                printf("method not GET");
+                continue;
+            }
+            printf("protocol is: %s\n", protocol);
 
+            const char *file = parse_route(route);
+            send_file(new_fd, file);
+            // child closes his copy of new_fd
+            close(new_fd);
+            exit(0);
+        }
+        // parent closes original new_fd
         close(new_fd);
     }
         close(sock_fd);
