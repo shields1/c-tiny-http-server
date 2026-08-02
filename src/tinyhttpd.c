@@ -178,7 +178,7 @@ void send_file(int sock_fd, const char *path) {
     size_t n_read = 0;
     while ((n_read = fread(buf, 1, sizeof(buf), f)) > 0) {
         if (send_all(sock_fd, buf, n_read) == -1) {
-            perror("Tiny > send");
+            perror("tinyhttpd > send");
             break;
         }
     }
@@ -263,7 +263,7 @@ int get_listener_socket(void) {
         }
         // lose the pesky "address already in use" error message
         if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
-            perror("Tiny > setsockopt");
+            perror("tinyhttpd > setsockopt");
             exit(EXIT_FAILURE);
         }
 
