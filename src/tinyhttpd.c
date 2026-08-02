@@ -1,4 +1,4 @@
-#include "../src/include/tiny.h"
+#include "../src/include/tinyhttpd.h"
 
 const char *get_content_type(const char *path) {
     const char *ext = strrchr(path, '.');
@@ -47,6 +47,85 @@ const char *parse_path(const char *path) {
     return NULL;
 }
 
+int parse_request(char *buf, size_t len, http_request *req) {
+    memset(req, 0, sizeof(*req));
+
+    char *line = buf;
+    char *end = buf + len;
+
+    int first_line = 1;
+
+    while (line < end) {
+        // Find end of current line
+        char *next = strstr(line, "\r\n");
+        if (next == NULL) {
+            return -1;
+        }
+        size_t line_len = next - line;
+        // Blank line = end of headers
+        if (line_len == 0) {
+            break;
+        }
+
+        if (first_line) {
+            char request_line[512];
+
+            if (line_len >= sizeof(request_line)) {
+                return -1;
+            }
+
+            memcpy(request_line, line, line_len);
+            request_line[line_len] = '\0';
+
+            if (sscanf(request_line,
+                       "%7s %255s %15s",
+                       req->method,
+                       req->path,
+                       req->protocol) != 3) {
+                return -1;
+            }
+            first_line = 0;
+        } else {
+            char header[1024];
+
+            if (line_len >= sizeof(header)) {
+                return -1;
+            }
+
+            memcpy(header, line, line_len);
+            header[line_len] = '\0';
+
+            char *colon = strchr(header, ':');
+
+            if (colon == NULL) {
+                line = next + 2;
+                continue;
+            }
+
+            *colon = '\0';
+
+            char *key = header;
+            char *value = colon + 1;
+
+            while (*value == ' ') {
+                value++;
+            }
+
+            if (strcmp(key, "Host") == 0) {
+                strncpy(req->host, value, sizeof(req->host) - 1);
+            } else if (strcmp(key, "User-Agent") == 0) {
+                strncpy(req->user_agent, value, sizeof(req->user_agent) - 1);
+            } else if (strcmp(key, "Connection") == 0) {
+                strncpy(req->connection, value, sizeof(req->connection) - 1);
+            } else if (strcmp(key, "X-Forwarded-For") == 0) {
+                strncpy(req->real_ip, value, sizeof(req->real_ip) - 1);
+            }
+        }
+        line = next + 2;
+    }
+    return 0;
+}
+
 int send_all(int s, const char *buf, size_t len) {
     size_t total = 0; // how many bytes have we sent
     ssize_t n;
@@ -69,7 +148,7 @@ void send_file(int sock_fd, const char *path) {
                           "Content-Length: 0\r\n"
                           "Connection: close\r\n"
                           "\r\n";
-        send_all(sock_fd, (char *)err, strlen(err));
+        send_all(sock_fd, err, strlen(err));
         return;
     }
     // find file size
@@ -85,7 +164,7 @@ void send_file(int sock_fd, const char *path) {
              "Content-Type: %s\r\n"
              "Content-Length: %ld\r\n"
              "Connection: close\r\n"
-             "Server: Tiny\r\n"
+             "Server: tinyhttpd\r\n"
              "\r\n",
              content_type,
              size);
@@ -133,10 +212,7 @@ int main() {
     int yes = 1;
     char s[INET6_ADDRSTRLEN];
     char buf[BUFFER_SIZE + 1];
-    char *token;
-    char *method;
-    char *path;
-    char *protocol;
+
     int rv, numbytes;
     // When running under systemd, stdout may be buffered.
     // This should fix this.
@@ -161,14 +237,14 @@ int main() {
     // hints.ai_flags = AI_PASSIVE; // use my IP
 
     if ((rv = getaddrinfo("127.0.0.1", PORT, &hints, &servinfo)) != 0) {
-        fprintf(stderr, "Tiny > getaddrinfo: %s\n", gai_strerror(rv));
+        fprintf(stderr, "tinyhttpd > getaddrinfo: %s\n", gai_strerror(rv));
         return 1;
     }
 
     // loop through all the results and bind to the first we can
     for (p = servinfo; p != NULL; p = p->ai_next) {
         if ((sock_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
-            perror("Tiny > socket");
+            perror("tinyhttpd > socket");
             continue;
         }
 
@@ -179,7 +255,7 @@ int main() {
 
         if (bind(sock_fd, p->ai_addr, p->ai_addrlen) == -1) {
             close(sock_fd);
-            perror("Tiny > bind");
+            perror("tinyhttpd > bind");
             continue;
         }
         break;
@@ -188,7 +264,7 @@ int main() {
     freeaddrinfo(servinfo); // all done with this structure
 
     if (p == NULL) {
-        fprintf(stderr, "Tiny > failed to bind\n");
+        fprintf(stderr, "tinyhttpd > failed to bind\n");
         exit(EXIT_FAILURE);
     }
 
@@ -205,7 +281,7 @@ int main() {
         exit(1);
     }
 
-    printf("Tiny > waiting for connections...\n");
+    printf("tinyhttpd > waiting for connections...\n");
 
     while (1) {
         sin_size = sizeof(their_addr);
@@ -215,7 +291,7 @@ int main() {
         }
 
         inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof(s));
-        printf("Tiny > got connection from %s\n", s);
+        printf("tinyhttpd > got connection from %s\n", s);
         if (!fork()) {
             close(sock_fd); // child does not need the listner
 
@@ -224,19 +300,26 @@ int main() {
                 exit(EXIT_FAILURE);
             }
             buf[numbytes] = '\0';
-            printf("server: received %d bytes\n'%s'\n", numbytes, buf);
+            // printf("server: received %d bytes\n'%s'\n", numbytes, buf);
+            http_request req;
+            if (parse_request(buf, numbytes, &req) != 0) {
+                const char *err = "HTTP/1.1 400 Bad Request\r\n"
+                                  "Content-Length: 0\r\n"
+                                  "Connection: close\r\n"
+                                  "\r\n";
+                send_all(new_fd, (char *)err, strlen(err));
+                close(new_fd);
+                exit(0);
+            }
+            printf("Method      : %s\n", req.method);
+            printf("Path        : %s\n", req.path);
+            printf("Protocol    : %s\n", req.protocol);
+            printf("Host        : %s\n", req.host);
+            printf("Real IP     : %s\n", req.real_ip);
+            printf("User-Agent  : %s\n", req.user_agent);
+            printf("Connection  : %s\n", req.connection);
 
-            // fetch HTTP method
-            token = strtok(buf, " ");
-            method = token;
-            // fetch path
-            token = strtok(NULL, " ");
-            path = token;
-            // fetch protocol
-            token = strtok(NULL, "\n");
-            protocol = token;
-
-            if (strcmp(method, "GET") != 0) {
+            if (strcmp(req.method, "GET") != 0) {
                 const char *err = "HTTP/1.1 405 Method Not Allowed\r\n"
                                   "Content-Length: 0\r\n"
                                   "Connection: close\r\n"
@@ -246,7 +329,7 @@ int main() {
                 exit(0);
             }
 
-            const char *file = parse_path(path);
+            const char *file = parse_path(req.path);
             if (file == NULL) {
                 const char *err =
                     "HTTP/1.1 404 Not Found\r\n"
