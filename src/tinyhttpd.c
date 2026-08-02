@@ -185,13 +185,9 @@ void send_file(int sock_fd, const char *path) {
     fclose(f);
 }
 
-void sigchld_handler(int s) {
-    (void)s; // quite unused variable warning
-    // waitpid() might overwrite errno, so we save and restore it:
-    int saved_errno = errno;
-    while (waitpid(-1, NULL, WNOHANG) > 0)
-        ;
-    errno = saved_errno;
+void sigterm_handler(int s) {
+    (void)s;
+    running = 0;
 }
 
 // get sockaddr, IPv4 or IPv6:
@@ -203,20 +199,38 @@ void *get_in_addr(struct sockaddr *sa) {
     return &(((struct sockaddr_in6 *)sa)->sin6_addr);
 }
 
-int main() {
-    int sock_fd, new_fd; // listen on sock_fd, new connection on new_fd
-    struct addrinfo hints, *servinfo, *p;
-    struct sockaddr_storage their_addr; // connector's address information
-    socklen_t sin_size;
-    struct sigaction sa;
-    int yes = 1;
-    char s[INET6_ADDRSTRLEN];
-    char buf[BUFFER_SIZE + 1];
+/*
+ * Convert socket to IP address string.
+ * addr: struct sockaddr_in or struct sockaddr_in6
+ */
+const char *inet_ntop2(void *addr, char *buf, size_t size) {
+    struct sockaddr_storage *sas = addr;
+    struct sockaddr_in *sa4;
+    struct sockaddr_in *sa6;
+    void *src;
 
-    int rv, numbytes;
-    // When running under systemd, stdout may be buffered.
-    // This should fix this.
-    setvbuf(stdout, NULL, _IONBF, 0);
+    switch (sas->ss_family) {
+    case AF_INET:
+        sa4 = addr;
+        src = &(sa4->sin_addr);
+        break;
+    case AF_INET6:
+        sa6 = addr;
+        src = &(sa6->sin_addr);
+        break;
+    default:
+        return NULL;
+    }
+
+    return inet_ntop(sas->ss_family, src, buf, size);
+}
+int get_listener_socket(void) {
+    struct addrinfo hints, *ai, *p;
+    int yes = 1; // for setsockopt() SO_REUSEADDR, below
+    int rv;
+    int listener;
+
+    // get use a socket and bint it
     //*
     // Let Mail-in-a-box with nginx be infront of my server and forward traffic
     //                 Internet
@@ -236,116 +250,191 @@ int main() {
     hints.ai_socktype = SOCK_STREAM;
     // hints.ai_flags = AI_PASSIVE; // use my IP
 
-    if ((rv = getaddrinfo("127.0.0.1", PORT, &hints, &servinfo)) != 0) {
+    if ((rv = getaddrinfo("127.0.0.1", PORT, &hints, &ai)) != 0) {
         fprintf(stderr, "tinyhttpd > getaddrinfo: %s\n", gai_strerror(rv));
         return 1;
     }
 
     // loop through all the results and bind to the first we can
-    for (p = servinfo; p != NULL; p = p->ai_next) {
-        if ((sock_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+    for (p = ai; p != NULL; p = p->ai_next) {
+        if ((listener = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
             perror("tinyhttpd > socket");
             continue;
         }
-
-        if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+        // lose the pesky "address already in use" error message
+        if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
             perror("Tiny > setsockopt");
             exit(EXIT_FAILURE);
         }
 
-        if (bind(sock_fd, p->ai_addr, p->ai_addrlen) == -1) {
-            close(sock_fd);
+        if (bind(listener, p->ai_addr, p->ai_addrlen) == -1) {
+            close(listener);
             perror("tinyhttpd > bind");
             continue;
         }
         break;
     }
 
-    freeaddrinfo(servinfo); // all done with this structure
+    freeaddrinfo(ai); // all done with this structure
 
+    // if we got here, it means we didn't get bound
     if (p == NULL) {
         fprintf(stderr, "tinyhttpd > failed to bind\n");
         exit(EXIT_FAILURE);
     }
 
-    if (listen(sock_fd, BACKLOG) == -1) {
+    // listen
+    if (listen(listener, BACKLOG) == -1) {
         perror("listen");
         exit(EXIT_FAILURE);
     }
 
-    sa.sa_handler = sigchld_handler; // reap all dead processes
+    return listener;
+}
+
+void handle_new_connection(int listener, fd_set *master, int *fdmax) {
+    socklen_t addrlen;
+    int newfd;                          // newly accept()ed socket descriptor
+    struct sockaddr_storage remoteaddr; // client address
+    char remote_ip[INET6_ADDRSTRLEN];
+
+    addrlen = sizeof(remoteaddr);
+    newfd = accept(listener, (struct sockaddr *)&remoteaddr, &addrlen);
+
+    if (newfd == -1) {
+        perror("accept");
+    } else {
+        FD_SET(newfd, master); // add to master set
+        if (newfd > *fdmax) {  // keep track of the max
+            *fdmax = newfd;
+        }
+        printf("tinyhttpd > new connection from %s on socket %d\n",
+               inet_ntop2(&remoteaddr, remote_ip, sizeof(remote_ip)), newfd);
+    }
+}
+
+void handle_client_data(int s, fd_set *master) {
+    char buf[BUFFER_SIZE + 1]; // buffer for client data
+    int nbytes;
+
+    // handle data from a client
+    if ((nbytes = recv(s, buf, sizeof(buf), 0)) <= 0) {
+        // got error or connection closed by client
+        if (nbytes == 0) {
+            // connection closed
+            printf("tinyhttpd > client %d disconnected\n", s);
+        } else {
+            perror("recv");
+        }
+        close(s);          // bye!
+        FD_CLR(s, master); // remove from master set
+    } else {
+        // we got some data from a client
+        buf[nbytes] = '\0';
+        // printf("server: received %d bytes\n'%s'\n", numbytes, buf);
+        http_request req;
+        if (parse_request(buf, nbytes, &req) != 0) {
+            const char *err = "HTTP/1.1 400 Bad Request\r\n"
+                              "Content-Length: 0\r\n"
+                              "Connection: close\r\n"
+                              "\r\n";
+            send_all(s, (char *)err, strlen(err));
+            close(s);
+            FD_CLR(s, master);
+            return;
+        }
+        printf("Method      : %s\n", req.method);
+        printf("Path        : %s\n", req.path);
+        printf("Protocol    : %s\n", req.protocol);
+        printf("Host        : %s\n", req.host);
+        printf("Real IP     : %s\n", req.real_ip);
+        printf("User-Agent  : %s\n", req.user_agent);
+        printf("Connection  : %s\n", req.connection);
+
+        if (strcmp(req.method, "GET") != 0) {
+            const char *err = "HTTP/1.1 405 Method Not Allowed\r\n"
+                              "Content-Length: 0\r\n"
+                              "Connection: close\r\n"
+                              "\r\n";
+            send_all(s, (char *)err, strlen(err));
+        }
+
+        const char *file = parse_path(req.path);
+        if (file == NULL) {
+            const char *err =
+                "HTTP/1.1 404 Not Found\r\n"
+                "Content-Length: 0\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            send_all(s, err, strlen(err));
+        } else {
+            send_file(s, file);
+        }
+    }
+}
+int main(void) {
+    // When running under systemd, stdout may be buffered.
+    // This should fix this.
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    fd_set master;   // master file descriptor list
+    fd_set read_fds; // temp file descriptor list for select()
+    int fdmax;       // maximum file descriptor number
+
+    int listener; // listening socket descriptor
+
+    FD_ZERO(&master); // clear the master and temp sets
+    FD_ZERO(&read_fds);
+
+    listener = get_listener_socket();
+
+    // add the listener to the master set
+    FD_SET(listener, &master);
+
+    // keep track of the biggest file descriptor
+    fdmax = listener; // so far, it's this one
+
+    struct sigaction sa = {0};
+    sa.sa_handler = sigterm_handler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+    sa.sa_flags = 0;
+    if (sigaction(SIGTERM, &sa, NULL) == -1) {
         perror("sigaction");
-        exit(1);
+        exit(EXIT_FAILURE);
     }
-
+    if (sigaction(SIGINT, &sa, NULL) == -1) {
+        perror("sigaction SIGINT");
+        exit(EXIT_FAILURE);
+    }
     printf("tinyhttpd > waiting for connections...\n");
-
-    while (1) {
-        sin_size = sizeof(their_addr);
-        if ((new_fd = accept(sock_fd, (struct sockaddr *)&their_addr, &sin_size)) == -1) {
-            perror("accept");
-            continue;
+    // main loop
+    while (running) {
+        read_fds = master; // copy it
+        if (select(fdmax + 1, &read_fds, NULL, NULL, NULL) == -1) {
+            if (errno == EINTR)
+                continue;
+            perror("select");
+            exit(4);
         }
-
-        inet_ntop(their_addr.ss_family, get_in_addr((struct sockaddr *)&their_addr), s, sizeof(s));
-        printf("tinyhttpd > got connection from %s\n", s);
-        if (!fork()) {
-            close(sock_fd); // child does not need the listner
-
-            if ((numbytes = recv(new_fd, buf, sizeof(buf) - 1, 0)) == -1) {
-                perror("recv");
-                exit(EXIT_FAILURE);
+        // run through the existing connections looking for data to read
+        for (int i = 0; i <= fdmax; i++) {
+            if (FD_ISSET(i, &read_fds)) { // we got one!!
+                if (i == listener) {
+                    handle_new_connection(i, &master, &fdmax);
+                } else {
+                    handle_client_data(i, &master);
+                }
             }
-            buf[numbytes] = '\0';
-            // printf("server: received %d bytes\n'%s'\n", numbytes, buf);
-            http_request req;
-            if (parse_request(buf, numbytes, &req) != 0) {
-                const char *err = "HTTP/1.1 400 Bad Request\r\n"
-                                  "Content-Length: 0\r\n"
-                                  "Connection: close\r\n"
-                                  "\r\n";
-                send_all(new_fd, (char *)err, strlen(err));
-                close(new_fd);
-                exit(0);
-            }
-            printf("Method      : %s\n", req.method);
-            printf("Path        : %s\n", req.path);
-            printf("Protocol    : %s\n", req.protocol);
-            printf("Host        : %s\n", req.host);
-            printf("Real IP     : %s\n", req.real_ip);
-            printf("User-Agent  : %s\n", req.user_agent);
-            printf("Connection  : %s\n", req.connection);
-
-            if (strcmp(req.method, "GET") != 0) {
-                const char *err = "HTTP/1.1 405 Method Not Allowed\r\n"
-                                  "Content-Length: 0\r\n"
-                                  "Connection: close\r\n"
-                                  "\r\n";
-                send_all(new_fd, (char *)err, strlen(err));
-                close(new_fd);
-                exit(0);
-            }
-
-            const char *file = parse_path(req.path);
-            if (file == NULL) {
-                const char *err =
-                    "HTTP/1.1 404 Not Found\r\n"
-                    "Content-Length: 0\r\n"
-                    "Connection: close\r\n"
-                    "\r\n";
-                send_all(new_fd, err, strlen(err));
-            } else {
-                send_file(new_fd, file);
-            }
-            close(new_fd);
-            exit(0);
         }
-        // parent closes original new_fd
-        close(new_fd);
     }
-    close(sock_fd);
+
+    // Cleanup
+    close(listener);
+    for (int i = 0; i <= fdmax; i++) {
+        if (FD_ISSET(i, &master))
+            close(i);
+    }
+    printf("tinyhttpd > shutdown complete\n");
+
     return 0;
 }
